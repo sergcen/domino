@@ -43,14 +43,14 @@ impl ProjectIndex {
     let mut excludes = FxHashMap::default();
 
     for project in projects {
+      let source_root = normalize_project_root(&project.source_root, cwd);
+      let project_root = normalize_project_root(&project.root, cwd);
+
       // Index by sourceRoot (primary)
-      if let Some(entry) = map
-        .iter_mut()
-        .find(|(root, _)| *root == project.source_root)
-      {
+      if let Some(entry) = map.iter_mut().find(|(root, _)| *root == source_root) {
         entry.1.push(project.name.clone());
       } else {
-        map.push((project.source_root.clone(), vec![project.name.clone()]));
+        map.push((source_root.clone(), vec![project.name.clone()]));
       }
 
       // Index by root (fallback) — only when root differs from sourceRoot.
@@ -61,14 +61,14 @@ impl ProjectIndex {
       // project lives at the workspace root; guard against "." too for
       // loaders that preserve it literally or when paths come in with a
       // `./` prefix.
-      if project.root != project.source_root
-        && !project.root.as_os_str().is_empty()
-        && project.root != Path::new(".")
+      if project_root != source_root
+        && !project_root.as_os_str().is_empty()
+        && project_root != Path::new(".")
       {
-        if let Some(entry) = root_map.iter_mut().find(|(root, _)| *root == project.root) {
+        if let Some(entry) = root_map.iter_mut().find(|(root, _)| *root == project_root) {
           entry.1.push(project.name.clone());
         } else {
-          root_map.push((project.root.clone(), vec![project.name.clone()]));
+          root_map.push((project_root, vec![project.name.clone()]));
         }
       }
 
@@ -175,6 +175,14 @@ impl ProjectIndex {
       }
     }
     result
+  }
+}
+
+fn normalize_project_root(root: &Path, cwd: &Path) -> PathBuf {
+  if root.is_absolute() {
+    root.strip_prefix(cwd).unwrap_or(root).to_path_buf()
+  } else {
+    root.to_path_buf()
   }
 }
 
@@ -293,6 +301,29 @@ mod tests {
     assert_eq!(
       index.get_package_names_by_path(Path::new("other/file.ts")),
       Vec::<String>::new()
+    );
+  }
+
+  #[test]
+  fn test_project_index_matches_relative_file_with_absolute_project_root() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cwd = tmp.path();
+    let projects = vec![Project {
+      name: "@terminal/core".to_string(),
+      root: cwd.join("packages/core"),
+      source_root: cwd.join("packages/core"),
+      ts_config: None,
+      implicit_dependencies: vec![],
+      targets: vec![],
+    }];
+
+    let index = ProjectIndex::new(&projects, cwd);
+
+    assert_eq!(
+      index.get_owning_packages_by_path(Path::new(
+        "packages/core/src/lib/certificates/base64ToText.ts"
+      )),
+      vec!["@terminal/core".to_string()]
     );
   }
 

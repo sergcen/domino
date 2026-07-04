@@ -2,6 +2,7 @@ use crate::types::Project;
 use json_strip_comments::StripComments;
 use oxc_resolver::{AliasValue, ResolveOptions};
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::warn;
@@ -9,9 +10,9 @@ use tracing::warn;
 /// Shared resolver configuration for both the import index builder and the reference finder.
 /// Kept in one place to prevent drift between the two resolution paths.
 ///
-/// Accepts the workspace project list so it can build aliases that point bare package
-/// imports (e.g. `@scope/contracts`) directly at their **source** roots instead of
-/// letting the resolver follow `package.json` `exports`/`main` into `dist/`.
+/// Builds aliases that keep workspace imports on source files. When
+/// `resolve_package_exports` is enabled, source-target package exports are tried before
+/// the existing package-to-src fallback.
 ///
 /// # Known limitation: `src/` heuristic
 ///
@@ -22,43 +23,33 @@ use tracing::warn;
 /// would be to resolve the package entry point normally, then check for a `source` field
 /// in `package.json` (a convention used by several monorepo tools like Preconstruct).
 /// This is left as a future improvement.
-pub fn create_resolve_options(cwd: &Path, projects: &[Project]) -> ResolveOptions {
+pub fn create_resolve_options(
+  cwd: &Path,
+  projects: &[Project],
+  resolve_package_exports: bool,
+) -> ResolveOptions {
   let tsconfig_path = cwd.join("tsconfig.base.json");
 
-  // Build aliases: @scope/pkg → <cwd>/<source_root>/src (or <source_root> if no src/ dir)
-  // This ensures cross-package imports resolve to source files that Domino analyses,
-  // rather than build output in dist/.
-  //
-  // Some workspace managers (e.g. Nx) already include /src in source_root, while others
-  // (e.g. Rush) set source_root to the project folder.  When source_root points at a
-  // project folder that contains a package.json, the resolver would follow exports/main
-  // into dist/.  Pointing the alias at the src/ subdirectory bypasses package.json
-  // entirely and lets main_files + extensions find index.ts directly.
+  // Export aliases must precede the package fallback: oxc_resolver stops after a
+  // matched alias whose target cannot be resolved.
   let alias = projects
     .iter()
-    .map(|p| {
-      let base = if p.source_root.is_absolute() {
-        p.source_root.clone()
+    .flat_map(|p| {
+      let source_target = project_source_alias_target(cwd, p);
+      let mut aliases = if resolve_package_exports {
+        package_exports_aliases(cwd, p, &source_target)
       } else {
-        cwd.join(&p.source_root)
+        Vec::new()
       };
-      // Prefer <project>/src when it exists (Rush-style project folders).
-      // If source_root already ends in src/ (Nx-style), or there is no src/ subdir,
-      // use source_root as-is.
-      let target = if !base.ends_with("src") {
-        let src_dir = base.join("src");
-        if src_dir.is_dir() {
-          src_dir
-        } else {
-          base
-        }
-      } else {
-        base
-      };
-      (
+
+      aliases.push((
         p.name.clone(),
-        vec![AliasValue::Path(target.to_string_lossy().into_owned())],
-      )
+        vec![AliasValue::Path(
+          source_target.to_string_lossy().into_owned(),
+        )],
+      ));
+
+      aliases
     })
     .collect::<Vec<_>>();
 
@@ -106,6 +97,185 @@ pub fn create_resolve_options(cwd: &Path, projects: &[Project]) -> ResolveOption
     },
     ..Default::default()
   }
+}
+
+fn absolute_project_path(cwd: &Path, path: &Path) -> PathBuf {
+  if path.is_absolute() {
+    path.to_path_buf()
+  } else {
+    cwd.join(path)
+  }
+}
+
+fn project_source_alias_target(cwd: &Path, project: &Project) -> PathBuf {
+  let base = absolute_project_path(cwd, &project.source_root);
+  // Prefer <project>/src when it exists (Rush-style project folders).
+  // If source_root already ends in src/ (Nx-style), or there is no src/ subdir,
+  // use source_root as-is.
+  if !base.ends_with("src") {
+    let src_dir = base.join("src");
+    if src_dir.is_dir() {
+      src_dir
+    } else {
+      base
+    }
+  } else {
+    base
+  }
+}
+
+fn package_exports_aliases(
+  cwd: &Path,
+  project: &Project,
+  source_target: &Path,
+) -> Vec<(String, Vec<AliasValue>)> {
+  let project_root = absolute_project_path(cwd, &project.root);
+  let package_json_path = project_root.join("package.json");
+  let package_json = match read_package_json(&package_json_path) {
+    Some(package_json) => package_json,
+    None => return vec![],
+  };
+  let Some(exports) = package_json.exports else {
+    return vec![];
+  };
+
+  let mut entries = package_exports_entries(&exports);
+  // oxc_resolver alias matching is declaration-ordered and a broader prefix alias can stop
+  // resolution before a more specific entry is tried. Keep export aliases most-specific first.
+  entries.sort_by(|(left_subpath, _), (right_subpath, _)| {
+    export_specificity(right_subpath).cmp(&export_specificity(left_subpath))
+  });
+
+  entries
+    .into_iter()
+    .filter_map(|(subpath, targets)| {
+      let alias_target = targets
+        .iter()
+        .find_map(|target| export_target_path(&project_root, source_target, target))?;
+      let alias_key = export_alias_key(&project.name, &subpath)?;
+      Some((
+        alias_key,
+        vec![AliasValue::Path(
+          alias_target.to_string_lossy().into_owned(),
+        )],
+      ))
+    })
+    .collect()
+}
+
+#[derive(Deserialize)]
+struct PackageJsonExports {
+  exports: Option<Value>,
+}
+
+fn read_package_json(path: &Path) -> Option<PackageJsonExports> {
+  let content = match std::fs::read_to_string(path) {
+    Ok(content) => content,
+    Err(e) => {
+      if path.exists() {
+        warn!("Failed to read {}: {}", path.display(), e);
+      }
+      return None;
+    }
+  };
+
+  match serde_json::from_str(&content) {
+    Ok(package_json) => Some(package_json),
+    Err(e) => {
+      warn!("Failed to parse {}: {}", path.display(), e);
+      None
+    }
+  }
+}
+
+fn package_exports_entries(exports: &Value) -> Vec<(String, Vec<String>)> {
+  if let Value::Object(map) = exports {
+    if map.keys().any(|key| key.starts_with('.')) {
+      return map
+        .iter()
+        .map(|(subpath, value)| (subpath.clone(), export_targets(value)))
+        .filter(|(_, targets)| !targets.is_empty())
+        .collect();
+    }
+  }
+
+  let targets = export_targets(exports);
+  if targets.is_empty() {
+    vec![]
+  } else {
+    vec![(".".to_string(), targets)]
+  }
+}
+
+fn export_targets(value: &Value) -> Vec<String> {
+  match value {
+    Value::String(target) => vec![target.clone()],
+    Value::Array(values) => values.iter().flat_map(export_targets).collect(),
+    Value::Object(map) => ["import", "default", "types"]
+      .iter()
+      .filter_map(|condition| map.get(*condition))
+      .flat_map(export_targets)
+      .collect(),
+    _ => vec![],
+  }
+}
+
+fn export_alias_key(package_name: &str, subpath: &str) -> Option<String> {
+  if subpath == "." {
+    return Some(format!("{package_name}$"));
+  }
+
+  let subpath = subpath.strip_prefix("./")?;
+  if subpath.is_empty() {
+    return None;
+  }
+
+  if subpath.contains('*') {
+    Some(format!("{package_name}/{subpath}"))
+  } else {
+    Some(format!("{package_name}/{subpath}$"))
+  }
+}
+
+fn export_target_path(project_root: &Path, source_target: &Path, target: &str) -> Option<PathBuf> {
+  let target = target.strip_prefix("./")?;
+  if target.is_empty() || target.split('/').any(|segment| segment == "..") {
+    return None;
+  }
+
+  let alias_target = project_root.join(target);
+  if is_under_source_target(&alias_target, source_target) {
+    Some(alias_target)
+  } else {
+    None
+  }
+}
+
+fn is_under_source_target(path: &Path, source_target: &Path) -> bool {
+  let source_target = source_target
+    .canonicalize()
+    .unwrap_or_else(|_| source_target.to_path_buf());
+  let path_without_wildcard = first_existing_ancestor(path);
+
+  path_without_wildcard.starts_with(&source_target)
+}
+
+fn first_existing_ancestor(path: &Path) -> PathBuf {
+  let mut candidate = path.to_path_buf();
+  while !candidate.exists() {
+    if !candidate.pop() {
+      break;
+    }
+  }
+
+  candidate
+    .canonicalize()
+    .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn export_specificity(subpath: &str) -> (usize, usize) {
+  let exactness = usize::from(!subpath.contains('*'));
+  (exactness, subpath.len())
 }
 
 /// Returns `true` if the specifier is potentially workspace-internal and should be
@@ -338,7 +508,7 @@ mod tests {
       targets: vec![],
     }];
 
-    let opts = create_resolve_options(cwd, &projects);
+    let opts = create_resolve_options(cwd, &projects, false);
     let target = alias_target(&opts, "@scope/my-lib").unwrap();
 
     assert!(
@@ -366,7 +536,7 @@ mod tests {
       targets: vec![],
     }];
 
-    let opts = create_resolve_options(cwd, &projects);
+    let opts = create_resolve_options(cwd, &projects, false);
     let target = alias_target(&opts, "@scope/my-lib").unwrap();
 
     assert!(
@@ -399,7 +569,7 @@ mod tests {
       targets: vec![],
     }];
 
-    let opts = create_resolve_options(cwd, &projects);
+    let opts = create_resolve_options(cwd, &projects, false);
     let target = alias_target(&opts, "@scope/my-lib").unwrap();
 
     assert!(
@@ -412,6 +582,221 @@ mod tests {
       !target.ends_with("src/src"),
       "Should not double-nest src/, got: {}",
       target
+    );
+  }
+
+  #[test]
+  fn test_alias_skips_package_exports_when_disabled() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path();
+
+    let proj_dir = cwd.join("packages/chat");
+    fs::create_dir_all(proj_dir.join("src/shared/lib/ChatContext")).unwrap();
+    fs::write(
+      proj_dir.join("package.json"),
+      r#"{
+        "name": "@scope/chat",
+        "exports": {
+          "./chatContext": {
+            "import": "./src/shared/lib/ChatContext/index.ts"
+          }
+        }
+      }"#,
+    )
+    .unwrap();
+
+    let projects = vec![Project {
+      name: "@scope/chat".to_string(),
+      root: PathBuf::from("packages/chat"),
+      source_root: PathBuf::from("packages/chat"),
+      ts_config: None,
+      implicit_dependencies: vec![],
+      targets: vec![],
+    }];
+
+    let opts = create_resolve_options(cwd, &projects, false);
+
+    assert!(alias_target(&opts, "@scope/chat/chatContext$").is_none());
+    assert!(alias_target(&opts, "@scope/chat")
+      .unwrap()
+      .ends_with("packages/chat/src"));
+  }
+
+  #[test]
+  fn test_alias_uses_exact_package_exports_before_src_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path();
+
+    let proj_dir = cwd.join("packages/chat");
+    fs::create_dir_all(proj_dir.join("src/shared/lib/ChatContext")).unwrap();
+    fs::write(
+      proj_dir.join("package.json"),
+      r#"{
+        "name": "@scope/chat",
+        "exports": {
+          "./chatContext": {
+            "import": "./src/shared/lib/ChatContext/index.ts",
+            "types": "./dist/chatContext.d.ts"
+          }
+        }
+      }"#,
+    )
+    .unwrap();
+
+    let projects = vec![Project {
+      name: "@scope/chat".to_string(),
+      root: PathBuf::from("packages/chat"),
+      source_root: PathBuf::from("packages/chat"),
+      ts_config: None,
+      implicit_dependencies: vec![],
+      targets: vec![],
+    }];
+
+    let opts = create_resolve_options(cwd, &projects, true);
+    let export_target = alias_target(&opts, "@scope/chat/chatContext$").unwrap();
+    let fallback_target = alias_target(&opts, "@scope/chat").unwrap();
+
+    assert!(
+      export_target.ends_with("packages/chat/src/shared/lib/ChatContext/index.ts"),
+      "Expected exact export alias to point at package exports import target, got: {}",
+      export_target
+    );
+    assert!(
+      fallback_target.ends_with("packages/chat/src"),
+      "Expected fallback alias to still use src heuristic, got: {}",
+      fallback_target
+    );
+    assert!(
+      opts
+        .alias
+        .iter()
+        .position(|(key, _)| key == "@scope/chat/chatContext$")
+        < opts.alias.iter().position(|(key, _)| key == "@scope/chat"),
+      "export alias must be declared before the broad fallback alias"
+    );
+  }
+
+  #[test]
+  fn test_alias_uses_wildcard_package_exports() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path();
+
+    let proj_dir = cwd.join("packages/chat");
+    fs::create_dir_all(proj_dir.join("src/mocks")).unwrap();
+    fs::write(
+      proj_dir.join("package.json"),
+      r#"{
+        "name": "@scope/chat",
+        "exports": {
+          "./mocks/*": {
+            "import": "./src/mocks/*.ts"
+          }
+        }
+      }"#,
+    )
+    .unwrap();
+
+    let projects = vec![Project {
+      name: "@scope/chat".to_string(),
+      root: PathBuf::from("packages/chat"),
+      source_root: PathBuf::from("packages/chat"),
+      ts_config: None,
+      implicit_dependencies: vec![],
+      targets: vec![],
+    }];
+
+    let opts = create_resolve_options(cwd, &projects, true);
+    let target = alias_target(&opts, "@scope/chat/mocks/*").unwrap();
+
+    assert!(
+      target.ends_with("packages/chat/src/mocks/*.ts"),
+      "Expected wildcard export alias to point at package exports import target, got: {}",
+      target
+    );
+  }
+
+  #[test]
+  fn test_alias_uses_next_export_condition_when_first_target_is_dist() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path();
+
+    let proj_dir = cwd.join("packages/chat");
+    fs::create_dir_all(proj_dir.join("src/features")).unwrap();
+    fs::create_dir_all(proj_dir.join("dist")).unwrap();
+    fs::write(
+      proj_dir.join("package.json"),
+      r#"{
+        "name": "@scope/chat",
+        "exports": {
+          "./feature": {
+            "import": "./dist/feature.js",
+            "default": "./src/features/feature.ts"
+          }
+        }
+      }"#,
+    )
+    .unwrap();
+
+    let projects = vec![Project {
+      name: "@scope/chat".to_string(),
+      root: PathBuf::from("packages/chat"),
+      source_root: PathBuf::from("packages/chat"),
+      ts_config: None,
+      implicit_dependencies: vec![],
+      targets: vec![],
+    }];
+
+    let opts = create_resolve_options(cwd, &projects, true);
+    let target = alias_target(&opts, "@scope/chat/feature$").unwrap();
+
+    assert!(
+      target.ends_with("packages/chat/src/features/feature.ts"),
+      "Expected alias to skip dist import target and use source default target, got: {}",
+      target
+    );
+  }
+
+  #[test]
+  fn test_alias_ignores_package_exports_outside_source_target() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path();
+
+    let proj_dir = cwd.join("packages/chat");
+    fs::create_dir_all(proj_dir.join("src")).unwrap();
+    fs::create_dir_all(proj_dir.join("dist")).unwrap();
+    fs::write(
+      proj_dir.join("package.json"),
+      r#"{
+        "name": "@scope/chat",
+        "exports": {
+          "./chatContext": {
+            "import": "./dist/chatContext.js"
+          }
+        }
+      }"#,
+    )
+    .unwrap();
+
+    let projects = vec![Project {
+      name: "@scope/chat".to_string(),
+      root: PathBuf::from("packages/chat"),
+      source_root: PathBuf::from("packages/chat"),
+      ts_config: None,
+      implicit_dependencies: vec![],
+      targets: vec![],
+    }];
+
+    let opts = create_resolve_options(cwd, &projects, true);
+
+    assert!(
+      alias_target(&opts, "@scope/chat/chatContext$").is_none(),
+      "dist package exports should not replace the source fallback alias"
+    );
+    assert!(
+      alias_target(&opts, "@scope/chat")
+        .unwrap()
+        .ends_with("packages/chat/src"),
+      "fallback alias should remain available"
     );
   }
 
@@ -431,7 +816,7 @@ mod tests {
     }];
 
     // Must not panic — is_dir() on non-existent path returns false
-    let opts = create_resolve_options(cwd, &projects);
+    let opts = create_resolve_options(cwd, &projects, false);
     let target = alias_target(&opts, "@scope/ghost").unwrap();
 
     assert!(

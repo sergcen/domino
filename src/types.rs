@@ -151,6 +151,8 @@ pub struct TrueAffectedConfig {
   pub ignored_paths: Vec<String>,
   /// Lockfile change detection strategy
   pub lockfile_strategy: LockfileStrategy,
+  /// Resolve workspace package subpaths through package.json exports.
+  pub resolve_package_exports: bool,
 }
 
 /// Result of the true affected analysis

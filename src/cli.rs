@@ -65,6 +65,10 @@ enum Commands {
     /// Lockfile change detection strategy: none, direct, full
     #[arg(long, default_value = "direct")]
     lockfile_strategy: LockfileStrategy,
+
+    /// Resolve workspace imports through package.json exports before falling back to src/
+    #[arg(long)]
+    resolve_package_exports: bool,
   },
 }
 
@@ -103,6 +107,7 @@ pub fn run() -> Result<()> {
       profile,
       report,
       lockfile_strategy,
+      resolve_package_exports,
     } => {
       let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap());
 
@@ -169,6 +174,7 @@ pub fn run() -> Result<()> {
           ".git".to_string(),
         ],
         lockfile_strategy,
+        resolve_package_exports,
       };
 
       // Use the report-generating version if --report is specified

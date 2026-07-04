@@ -27,7 +27,11 @@ impl<'a> ReferenceFinder<'a> {
   pub fn new(analyzer: &'a WorkspaceAnalyzer, cwd: &Path, profiler: Arc<Profiler>) -> Self {
     Self {
       analyzer,
-      resolver: Resolver::new(super::create_resolve_options(cwd, &analyzer.projects)),
+      resolver: Resolver::new(super::create_resolve_options(
+        cwd,
+        &analyzer.projects,
+        analyzer.resolve_package_exports,
+      )),
       cwd: cwd.to_path_buf(),
       resolution_cache: RefCell::new(FxHashMap::default()),
       profiler,
@@ -399,8 +403,8 @@ mod tests {
 
     // Create analyzer and reference finder
     let profiler = Arc::new(Profiler::new(false));
-    let analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler.clone()).expect("Failed to create analyzer");
+    let analyzer = WorkspaceAnalyzer::new(vec![], cwd, profiler.clone(), false)
+      .expect("Failed to create analyzer");
     let reference_finder = ReferenceFinder::new(&analyzer, cwd, profiler);
 
     // Test: resolve "./colors.css" from libs/theme directory
@@ -437,8 +441,8 @@ mod tests {
 
     // Create analyzer and reference finder
     let profiler = Arc::new(Profiler::new(false));
-    let analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler.clone()).expect("Failed to create analyzer");
+    let analyzer = WorkspaceAnalyzer::new(vec![], cwd, profiler.clone(), false)
+      .expect("Failed to create analyzer");
     let reference_finder = ReferenceFinder::new(&analyzer, cwd, profiler);
 
     // Test: resolve "./utils" from src directory
@@ -472,8 +476,8 @@ mod tests {
 
     // Create analyzer and reference finder
     let profiler = Arc::new(Profiler::new(false));
-    let analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler.clone()).expect("Failed to create analyzer");
+    let analyzer = WorkspaceAnalyzer::new(vec![], cwd, profiler.clone(), false)
+      .expect("Failed to create analyzer");
     let reference_finder = ReferenceFinder::new(&analyzer, cwd, profiler);
 
     // Test: resolve "./components" from src directory
@@ -510,8 +514,8 @@ mod tests {
     fs::write(&utils_file, "export function helper() {}").expect("Failed to write test file");
 
     let profiler = Arc::new(Profiler::new(false));
-    let analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler.clone()).expect("Failed to create analyzer");
+    let analyzer = WorkspaceAnalyzer::new(vec![], cwd, profiler.clone(), false)
+      .expect("Failed to create analyzer");
     let reference_finder = ReferenceFinder::new(&analyzer, cwd, profiler);
 
     // Test: resolve "./utils.js" from src directory
@@ -546,8 +550,8 @@ mod tests {
       .expect("Failed to write test file");
 
     let profiler = Arc::new(Profiler::new(false));
-    let analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler.clone()).expect("Failed to create analyzer");
+    let analyzer = WorkspaceAnalyzer::new(vec![], cwd, profiler.clone(), false)
+      .expect("Failed to create analyzer");
     let reference_finder = ReferenceFinder::new(&analyzer, cwd, profiler);
 
     let context = src_dir.as_path();
@@ -580,8 +584,8 @@ mod tests {
     fs::write(&index_file, "export * from './User';").expect("Failed to write test file");
 
     let profiler = Arc::new(Profiler::new(false));
-    let analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler.clone()).expect("Failed to create analyzer");
+    let analyzer = WorkspaceAnalyzer::new(vec![], cwd, profiler.clone(), false)
+      .expect("Failed to create analyzer");
     let reference_finder = ReferenceFinder::new(&analyzer, cwd, profiler);
 
     let context = src_dir.as_path();

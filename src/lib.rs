@@ -83,6 +83,7 @@ mod napi_bindings {
     pub enable_profiling: Option<bool>,
     /// Lockfile change detection strategy: "none", "direct", "full" (default: "direct")
     pub lockfile_strategy: Option<String>,
+    pub resolve_package_exports: Option<bool>,
   }
 
   #[napi(object)]
@@ -114,6 +115,7 @@ mod napi_bindings {
       include: options.include.unwrap_or_default(),
       ignored_paths: options.ignored_paths.unwrap_or_default(),
       lockfile_strategy,
+      resolve_package_exports: options.resolve_package_exports.unwrap_or(false),
     };
 
     let result =

@@ -168,6 +168,7 @@ impl TestBranch {
       include: vec![],
       ignored_paths: vec![],
       lockfile_strategy: LockfileStrategy::None,
+      resolve_package_exports: false,
     };
 
     // Create a profiler (disabled for tests)
@@ -378,6 +379,7 @@ export function anotherFn() {
     include: vec![],
     ignored_paths: vec![],
     lockfile_strategy: LockfileStrategy::None,
+    resolve_package_exports: false,
   };
 
   let profiler = Arc::new(Profiler::new(false));
@@ -1949,6 +1951,7 @@ export function main() {
     include: vec![],
     ignored_paths: vec![],
     lockfile_strategy: LockfileStrategy::None,
+    resolve_package_exports: false,
   };
 
   let profiler = Arc::new(Profiler::new(false));
@@ -2059,6 +2062,7 @@ export function main() {
     include: vec![],
     ignored_paths: vec![],
     lockfile_strategy: LockfileStrategy::None,
+    resolve_package_exports: false,
   };
 
   let profiler = Arc::new(Profiler::new(false));
@@ -2188,6 +2192,7 @@ export function main() {
     include: vec![],
     ignored_paths: vec![],
     lockfile_strategy: LockfileStrategy::None,
+    resolve_package_exports: false,
   };
 
   let profiler = Arc::new(Profiler::new(false));
@@ -2202,6 +2207,304 @@ export function main() {
   assert!(
     affected.contains(&"@test/app".to_string()),
     "app should be affected (imports via bare specifier @test/lib/utils.js with extension_alias). Got: {:?}",
+    affected
+  );
+}
+
+/// Workspace package exports should resolve to source targets, even when public
+/// subpaths do not mirror the `src/` layout.
+#[test]
+fn test_workspace_package_exports_resolve_to_source_targets() {
+  let tmp = TempDir::new().expect("Failed to create temp dir");
+  let root = tmp
+    .path()
+    .canonicalize()
+    .expect("Failed to canonicalize temp dir");
+
+  let chat_src = root.join("packages/chat/src");
+  let exact_app_src = root.join("apps/exact-app/src");
+  let wildcard_app_src = root.join("apps/wildcard-app/src");
+  fs::create_dir_all(chat_src.join("shared/lib/ChatContext")).unwrap();
+  fs::create_dir_all(chat_src.join("test-fixtures")).unwrap();
+  fs::create_dir_all(&exact_app_src).unwrap();
+  fs::create_dir_all(&wildcard_app_src).unwrap();
+
+  fs::write(
+    root.join("packages/chat/package.json"),
+    r#"{
+  "name": "@scope/chat",
+  "exports": {
+    "./chatContext": {
+      "import": "./src/shared/lib/ChatContext/index.ts",
+      "types": "./dist/chatContext.d.ts"
+    },
+    "./mocks/*": {
+      "import": "./src/test-fixtures/*.ts"
+    }
+  }
+}"#,
+  )
+  .unwrap();
+
+  fs::write(
+    chat_src.join("shared/lib/ChatContext/index.ts"),
+    r#"export function chatContext() {
+  return 'original';
+}
+"#,
+  )
+  .unwrap();
+
+  fs::write(
+    chat_src.join("test-fixtures/user.ts"),
+    r#"export function mockUser() {
+  return 'original';
+}
+"#,
+  )
+  .unwrap();
+
+  fs::write(
+    exact_app_src.join("main.ts"),
+    r#"import { chatContext } from '@scope/chat/chatContext';
+
+export function render() {
+  return chatContext();
+}
+"#,
+  )
+  .unwrap();
+
+  fs::write(
+    wildcard_app_src.join("main.ts"),
+    r#"import { mockUser } from '@scope/chat/mocks/user';
+
+export function render() {
+  return mockUser();
+}
+"#,
+  )
+  .unwrap();
+
+  git_in(&root, &["init"]);
+  git_in(&root, &["config", "user.email", "test@test.com"]);
+  git_in(&root, &["config", "user.name", "Test"]);
+  git_in(&root, &["branch", "-M", "main"]);
+  git_in(&root, &["add", "."]);
+  git_in(&root, &["commit", "-m", "initial"]);
+
+  git_in(&root, &["checkout", "-b", "feature"]);
+
+  fs::write(
+    chat_src.join("shared/lib/ChatContext/index.ts"),
+    r#"export function chatContext() {
+  return 'modified';
+}
+"#,
+  )
+  .unwrap();
+  fs::write(
+    chat_src.join("test-fixtures/user.ts"),
+    r#"export function mockUser() {
+  return 'modified';
+}
+"#,
+  )
+  .unwrap();
+  git_in(&root, &["add", "."]);
+  git_in(&root, &["commit", "-m", "modify chat exports"]);
+
+  let run = |resolve_package_exports| {
+    let config = TrueAffectedConfig {
+      cwd: root.to_path_buf(),
+      base: "main".to_string(),
+      head: None,
+      root_ts_config: None,
+      projects: vec![
+        Project {
+          name: "@scope/chat".to_string(),
+          root: PathBuf::from("packages/chat"),
+          source_root: PathBuf::from("packages/chat"),
+          ts_config: None,
+          implicit_dependencies: vec![],
+          targets: vec![],
+        },
+        Project {
+          name: "exact-app".to_string(),
+          root: PathBuf::from("apps/exact-app"),
+          source_root: PathBuf::from("apps/exact-app"),
+          ts_config: None,
+          implicit_dependencies: vec![],
+          targets: vec![],
+        },
+        Project {
+          name: "wildcard-app".to_string(),
+          root: PathBuf::from("apps/wildcard-app"),
+          source_root: PathBuf::from("apps/wildcard-app"),
+          ts_config: None,
+          implicit_dependencies: vec![],
+          targets: vec![],
+        },
+      ],
+      include: vec![],
+      ignored_paths: vec![],
+      lockfile_strategy: LockfileStrategy::None,
+      resolve_package_exports,
+    };
+
+    let profiler = Arc::new(Profiler::new(false));
+    find_affected(config, profiler)
+      .expect("find_affected failed")
+      .affected_projects
+  };
+
+  let affected_without_flag = run(false);
+  assert!(
+    affected_without_flag.contains(&"@scope/chat".to_string()),
+    "chat should be affected directly. Got: {:?}",
+    affected_without_flag
+  );
+  assert!(
+    !affected_without_flag.contains(&"exact-app".to_string()),
+    "exact-app should not be affected without package exports resolution. Got: {:?}",
+    affected_without_flag
+  );
+  assert!(
+    !affected_without_flag.contains(&"wildcard-app".to_string()),
+    "wildcard-app should not be affected without package exports resolution. Got: {:?}",
+    affected_without_flag
+  );
+
+  let affected = run(true);
+
+  assert!(
+    affected.contains(&"@scope/chat".to_string()),
+    "chat should be affected (source exports changed). Got: {:?}",
+    affected
+  );
+  assert!(
+    affected.contains(&"exact-app".to_string()),
+    "exact-app should be affected via @scope/chat/chatContext package export. Got: {:?}",
+    affected
+  );
+  assert!(
+    affected.contains(&"wildcard-app".to_string()),
+    "wildcard-app should be affected via @scope/chat/mocks/* package export. Got: {:?}",
+    affected
+  );
+}
+
+#[test]
+fn test_workspace_package_exports_with_relative_cwd() {
+  let tmp = TempDir::new().expect("Failed to create temp dir");
+  let root = tmp
+    .path()
+    .canonicalize()
+    .expect("Failed to canonicalize temp dir");
+
+  let lib_src = root.join("packages/lib/src");
+  let app_src = root.join("apps/app/src");
+  fs::create_dir_all(&lib_src).unwrap();
+  fs::create_dir_all(&app_src).unwrap();
+
+  fs::write(
+    root.join("packages/lib/package.json"),
+    r#"{
+  "name": "@scope/lib",
+  "exports": {
+    "./feature": {
+      "import": "./src/feature.ts"
+    }
+  }
+}"#,
+  )
+  .unwrap();
+
+  fs::write(
+    lib_src.join("feature.ts"),
+    r#"export function feature() {
+  return 'original';
+}
+"#,
+  )
+  .unwrap();
+
+  fs::write(
+    app_src.join("main.ts"),
+    r#"import { feature } from '@scope/lib/feature';
+
+export function run() {
+  return feature();
+}
+"#,
+  )
+  .unwrap();
+
+  git_in(&root, &["init"]);
+  git_in(&root, &["config", "user.email", "test@test.com"]);
+  git_in(&root, &["config", "user.name", "Test"]);
+  git_in(&root, &["branch", "-M", "main"]);
+  git_in(&root, &["add", "."]);
+  git_in(&root, &["commit", "-m", "initial"]);
+
+  git_in(&root, &["checkout", "-b", "feature"]);
+  fs::write(
+    lib_src.join("feature.ts"),
+    r#"export function feature() {
+  return 'modified';
+}
+"#,
+  )
+  .unwrap();
+  git_in(&root, &["add", "."]);
+  git_in(&root, &["commit", "-m", "modify feature"]);
+
+  let current_dir = std::env::current_dir().expect("Failed to read current dir");
+  let relative_cwd =
+    pathdiff::diff_paths(&root, current_dir).expect("Failed to build relative cwd");
+
+  let config = TrueAffectedConfig {
+    cwd: relative_cwd,
+    base: "main".to_string(),
+    head: None,
+    root_ts_config: None,
+    projects: vec![
+      Project {
+        name: "@scope/lib".to_string(),
+        root: PathBuf::from("packages/lib"),
+        source_root: PathBuf::from("packages/lib"),
+        ts_config: None,
+        implicit_dependencies: vec![],
+        targets: vec![],
+      },
+      Project {
+        name: "app".to_string(),
+        root: PathBuf::from("apps/app"),
+        source_root: PathBuf::from("apps/app"),
+        ts_config: None,
+        implicit_dependencies: vec![],
+        targets: vec![],
+      },
+    ],
+    include: vec![],
+    ignored_paths: vec![],
+    lockfile_strategy: LockfileStrategy::None,
+    resolve_package_exports: true,
+  };
+
+  let profiler = Arc::new(Profiler::new(false));
+  let affected = find_affected(config, profiler)
+    .expect("find_affected failed")
+    .affected_projects;
+
+  assert!(
+    affected.contains(&"@scope/lib".to_string()),
+    "lib should be affected directly. Got: {:?}",
+    affected
+  );
+  assert!(
+    affected.contains(&"app".to_string()),
+    "app should be affected when package exports are resolved from a relative cwd. Got: {:?}",
     affected
   );
 }
@@ -2321,6 +2624,7 @@ export function run() {
     include: vec![],
     ignored_paths: vec![],
     lockfile_strategy: LockfileStrategy::None,
+    resolve_package_exports: false,
   };
 
   let profiler = Arc::new(Profiler::new(false));
@@ -2414,6 +2718,7 @@ fn test_shared_source_root_all_projects_affected() {
     include: vec![],
     ignored_paths: vec![],
     lockfile_strategy: LockfileStrategy::None,
+    resolve_package_exports: false,
   };
 
   let profiler = Arc::new(Profiler::new(false));
@@ -2595,6 +2900,7 @@ fn test_lockfile_direct_strategy_detects_importing_project() {
     include: vec![],
     ignored_paths: vec![],
     lockfile_strategy: LockfileStrategy::Direct,
+    resolve_package_exports: false,
   };
 
   let profiler = Arc::new(Profiler::new(false));
@@ -2651,6 +2957,7 @@ fn test_lockfile_full_strategy_traces_reference_chain() {
     include: vec![],
     ignored_paths: vec![],
     lockfile_strategy: LockfileStrategy::Full,
+    resolve_package_exports: false,
   };
 
   let profiler = Arc::new(Profiler::new(false));
@@ -2712,6 +3019,7 @@ fn test_lockfile_none_strategy_ignores_lockfile_changes() {
     include: vec![],
     ignored_paths: vec![],
     lockfile_strategy: LockfileStrategy::None,
+    resolve_package_exports: false,
   };
 
   let profiler = Arc::new(Profiler::new(false));
@@ -2764,6 +3072,7 @@ fn test_lockfile_transitive_dep_change_resolves_to_direct() {
     include: vec![],
     ignored_paths: vec![],
     lockfile_strategy: LockfileStrategy::Direct,
+    resolve_package_exports: false,
   };
 
   let profiler = Arc::new(Profiler::new(false));
@@ -2805,6 +3114,7 @@ fn test_lockfile_no_change_zero_impact() {
     include: vec![],
     ignored_paths: vec![],
     lockfile_strategy: LockfileStrategy::Direct,
+    resolve_package_exports: false,
   };
 
   let profiler = Arc::new(Profiler::new(false));
@@ -2953,6 +3263,7 @@ export const mockData: SharedType = { name: 'test' };
     include: vec![],
     ignored_paths: vec![],
     lockfile_strategy: LockfileStrategy::None,
+    resolve_package_exports: false,
   };
 
   let profiler = Arc::new(Profiler::new(false));
@@ -3079,6 +3390,7 @@ export const mockData: SharedType = { name: 'test' };
     include: vec![],
     ignored_paths: vec![],
     lockfile_strategy: LockfileStrategy::None,
+    resolve_package_exports: false,
   };
 
   let profiler = Arc::new(Profiler::new(false));
@@ -3241,6 +3553,7 @@ impl TempNxRepo {
       include: vec![],
       ignored_paths: vec![],
       lockfile_strategy: LockfileStrategy::None,
+      resolve_package_exports: false,
     };
 
     let profiler = Arc::new(Profiler::new(false));
@@ -3260,6 +3573,7 @@ impl TempNxRepo {
       include: vec![],
       ignored_paths: vec![],
       lockfile_strategy: LockfileStrategy::None,
+      resolve_package_exports: false,
     };
 
     let profiler = Arc::new(Profiler::new(false));
@@ -3619,6 +3933,7 @@ fn test_workspace_root_project_not_over_attributed() {
     include: vec![],
     ignored_paths: vec![],
     lockfile_strategy: LockfileStrategy::None,
+    resolve_package_exports: false,
   };
 
   let profiler = Arc::new(Profiler::new(false));
@@ -3695,6 +4010,7 @@ fn test_spec_file_change_affects_owning_project() {
     include: vec![],
     ignored_paths: vec![],
     lockfile_strategy: LockfileStrategy::None,
+    resolve_package_exports: false,
   };
 
   let profiler = Arc::new(Profiler::new(false));
@@ -3765,6 +4081,7 @@ export function unusedFn() {
     include: vec![],
     ignored_paths: vec![],
     lockfile_strategy: LockfileStrategy::None,
+    resolve_package_exports: false,
   };
 
   let profiler = Arc::new(Profiler::new(false));

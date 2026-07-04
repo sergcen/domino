@@ -80,11 +80,17 @@ pub struct WorkspaceAnalyzer {
   pub tsconfig_path_prefixes: Vec<String>,
   /// Profiler for performance measurement
   pub profiler: Arc<Profiler>,
+  pub resolve_package_exports: bool,
 }
 
 impl WorkspaceAnalyzer {
   /// Create a new workspace analyzer
-  pub fn new(projects: Vec<Project>, cwd: &Path, profiler: Arc<Profiler>) -> Result<Self> {
+  pub fn new(
+    projects: Vec<Project>,
+    cwd: &Path,
+    profiler: Arc<Profiler>,
+    resolve_package_exports: bool,
+  ) -> Result<Self> {
     let tsconfig_path_prefixes = super::parse_tsconfig_path_prefixes(cwd);
 
     let mut analyzer = Self {
@@ -95,6 +101,7 @@ impl WorkspaceAnalyzer {
       import_index: FxHashMap::default(),
       tsconfig_path_prefixes,
       profiler,
+      resolve_package_exports,
     };
 
     analyzer.analyze_workspace(cwd)?;
@@ -110,7 +117,11 @@ impl WorkspaceAnalyzer {
   fn build_import_index(&mut self, cwd: &Path) -> Result<()> {
     use oxc_resolver::Resolver;
 
-    let resolver = Resolver::new(super::create_resolve_options(cwd, &self.projects));
+    let resolver = Resolver::new(super::create_resolve_options(
+      cwd,
+      &self.projects,
+      self.resolve_package_exports,
+    ));
     use tracing::debug;
 
     let mut index: ImportIndexMap = FxHashMap::default();
@@ -1057,7 +1068,7 @@ export { MemoizedComponent };"#;
     let cwd = Path::new(".");
     let profiler = Arc::new(Profiler::new(false));
     let mut analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler).expect("Failed to create analyzer");
+      WorkspaceAnalyzer::new(vec![], cwd, profiler, false).expect("Failed to create analyzer");
 
     // Parse the source file using the same approach as analyze_file
     let file_path = Path::new("test.ts");
@@ -1119,7 +1130,7 @@ export const MY_REGEX = new RegExp(combined)"#;
     let cwd = Path::new(".");
     let profiler = Arc::new(Profiler::new(false));
     let mut analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler).expect("Failed to create analyzer");
+      WorkspaceAnalyzer::new(vec![], cwd, profiler, false).expect("Failed to create analyzer");
 
     let file_path = Path::new("test.ts");
     let source_type = SourceType::from_path(file_path)
@@ -1169,7 +1180,7 @@ var localVar = 2"#;
     let cwd = Path::new(".");
     let profiler = Arc::new(Profiler::new(false));
     let mut analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler).expect("Failed to create analyzer");
+      WorkspaceAnalyzer::new(vec![], cwd, profiler, false).expect("Failed to create analyzer");
 
     let file_path = Path::new("test.ts");
     let source_type = SourceType::from_path(file_path)
@@ -1252,7 +1263,7 @@ const [x, y] = [1, 2]"#;
     let cwd = Path::new(".");
     let profiler = Arc::new(Profiler::new(false));
     let mut analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler).expect("Failed to create analyzer");
+      WorkspaceAnalyzer::new(vec![], cwd, profiler, false).expect("Failed to create analyzer");
 
     // Parse the source file using the same approach as analyze_file
     let file_path = Path::new("test.ts");
@@ -1512,7 +1523,7 @@ const DynamicImport = await import('./dynamic');
     let cwd = Path::new(".");
     let profiler = Arc::new(Profiler::new(false));
     let mut analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler).expect("Failed to create analyzer");
+      WorkspaceAnalyzer::new(vec![], cwd, profiler, false).expect("Failed to create analyzer");
 
     let file_path = Path::new("test.ts");
     let source_type = SourceType::from_path(file_path)
@@ -1558,7 +1569,7 @@ const DynamicImport = await import('./dynamic');
     let cwd = Path::new(".");
     let profiler = Arc::new(Profiler::new(false));
     let mut analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler).expect("Failed to create analyzer");
+      WorkspaceAnalyzer::new(vec![], cwd, profiler, false).expect("Failed to create analyzer");
 
     let file_path = Path::new("test.ts");
     let source_type = SourceType::from_path(file_path)
@@ -1603,7 +1614,7 @@ export const { a, b } = obj;"#;
     let cwd = Path::new(".");
     let profiler = Arc::new(Profiler::new(false));
     let mut analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler).expect("Failed to create analyzer");
+      WorkspaceAnalyzer::new(vec![], cwd, profiler, false).expect("Failed to create analyzer");
 
     let file_path = Path::new("test.ts");
     let source_type = SourceType::from_path(file_path)
@@ -1648,7 +1659,7 @@ export function third() {
     let cwd = Path::new(".");
     let profiler = Arc::new(Profiler::new(false));
     let mut analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler).expect("Failed to create analyzer");
+      WorkspaceAnalyzer::new(vec![], cwd, profiler, false).expect("Failed to create analyzer");
 
     let file_path = Path::new("test.ts");
     let source_type = SourceType::from_path(file_path)
@@ -1708,7 +1719,7 @@ type Props = ui.ButtonProps;
     let cwd = Path::new(".");
     let profiler = Arc::new(Profiler::new(false));
     let mut analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler).expect("Failed to create analyzer");
+      WorkspaceAnalyzer::new(vec![], cwd, profiler, false).expect("Failed to create analyzer");
 
     let file_path = Path::new("test.tsx");
     let source_type = SourceType::from_path(file_path)
@@ -1804,7 +1815,7 @@ type Props = ui.ButtonProps;
     let cwd = Path::new(".");
     let profiler = Arc::new(Profiler::new(false));
     let mut analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler).expect("Failed to create analyzer");
+      WorkspaceAnalyzer::new(vec![], cwd, profiler, false).expect("Failed to create analyzer");
 
     let file_path = Path::new(file_name);
     let source_type = SourceType::from_path(file_path)

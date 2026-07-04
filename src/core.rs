@@ -78,6 +78,11 @@ fn find_affected_internal(
   generate_report: bool,
 ) -> Result<AffectedResult> {
   debug!("Starting true-affected analysis");
+  let cwd = config
+    .cwd
+    .canonicalize()
+    .unwrap_or_else(|_| config.cwd.clone());
+
   debug!("Base: {}", config.base);
   debug!("Projects: {}", config.projects.len());
 
@@ -88,7 +93,7 @@ fn find_affected_internal(
 
   // Step 1: Get changed files from git (also returns the merge-base SHA)
   let (changed_files, merge_base) =
-    git::get_changed_files(&config.cwd, &config.base, config.head.as_deref())?;
+    git::get_changed_files(&cwd, &config.base, config.head.as_deref())?;
   debug!("Found {} changed files", changed_files.len());
   let total_changed_files = changed_files.len();
 
@@ -108,7 +113,7 @@ fn find_affected_internal(
   // When --report IS requested, we continue through semantic analysis even on
   // a global run so the HTML can separate "globally invalidated" from
   // "semantically affected" projects — the whole point of the report.
-  let resolved_inputs = named_inputs::resolve_from_nx_json(&config.cwd);
+  let resolved_inputs = named_inputs::resolve_from_nx_json(&cwd);
   let global_triggers: Vec<GlobalTrigger> = if let Some(ref inputs) = resolved_inputs {
     named_inputs::check_global_invalidation(inputs, &changed_files)
   } else {
@@ -134,22 +139,27 @@ fn find_affected_internal(
   // Step 2: Build project index for O(unique_roots) lookups instead of O(n_projects)
   // Also parses each project's tsconfig to extract exclude patterns, so that
   // files excluded by tsconfig (e.g. stories, specs) don't mark a project affected.
-  let project_index = ProjectIndex::new(&config.projects, &config.cwd);
+  let project_index = ProjectIndex::new(&config.projects, &cwd);
 
   // Step 3: Build workspace analyzer (includes building import index)
   debug!("Building workspace semantic analysis...");
-  let analyzer = WorkspaceAnalyzer::new(config.projects.clone(), &config.cwd, profiler.clone())?;
+  let analyzer = WorkspaceAnalyzer::new(
+    config.projects.clone(),
+    &cwd,
+    profiler.clone(),
+    config.resolve_package_exports,
+  )?;
   debug!("Analyzed {} files", analyzer.files.len());
 
   // Step 4: Initialize reference finder
-  let reference_finder = ReferenceFinder::new(&analyzer, &config.cwd, profiler.clone());
+  let reference_finder = ReferenceFinder::new(&analyzer, &cwd, profiler.clone());
 
   // Step 5: Track affected packages and their causes
   let mut affected_packages = FxHashSet::default();
   let mut project_causes: FxHashMap<String, Vec<AffectCause>> = FxHashMap::default();
 
   // Step 5: Partition changed files into source and non-source (excluding lockfiles)
-  let detected_pm = lockfile::detect_package_manager(&config.cwd);
+  let detected_pm = lockfile::detect_package_manager(&cwd);
   let lockfile_filename = detected_pm.as_ref().map(|pm| lockfile::lockfile_name(pm));
 
   // Step 6: Partition changed files into source and non-source
@@ -317,7 +327,7 @@ fn find_affected_internal(
   // Step 6b: Process non-source asset files
   if !asset_files.is_empty() {
     debug!("Processing {} asset files", asset_files.len());
-    let asset_finder = AssetReferenceFinder::new(&config.cwd);
+    let asset_finder = AssetReferenceFinder::new(&cwd);
 
     for asset_file in &asset_files {
       let asset_path = &asset_file.file_path;
@@ -510,7 +520,7 @@ fn find_affected_internal(
     if let Some(ref pm) = detected_pm {
       if lockfile::has_lockfile_changed(&changed_files, pm) {
         debug!("Lockfile changed, strategy: {:?}", config.lockfile_strategy);
-        match lockfile::find_affected_dependencies(&config.cwd, &merge_base, pm) {
+        match lockfile::find_affected_dependencies(&cwd, &merge_base, pm) {
           Ok(affected_deps) if !affected_deps.is_empty() => {
             debug!("Found {} affected direct dependencies", affected_deps.len());
 
